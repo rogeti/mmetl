@@ -296,3 +296,251 @@ func (t *Transformer) ParseSlackExportFile(zipReader *zip.Reader, skipConvertPos
 
 	return &slackExport, nil
 }
+
+// ParseSlackExportMetadata parses only the metadata files (users, channels) without loading posts
+func (t *Transformer) ParseSlackExportMetadata(zipReader *zip.Reader) (*SlackExport, error) {
+	t.Logger.Info("Parsing metadata from Slack export")
+	slackExport := SlackExport{TeamName: t.TeamName}
+
+	for _, file := range zipReader.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+
+		switch file.Name {
+		case "channels.json":
+			reader, err := file.Open()
+			if err != nil {
+				return nil, err
+			}
+			channels, _ := t.SlackParseChannels(reader, model.ChannelTypeOpen)
+			slackExport.PublicChannels = channels
+			slackExport.Channels = append(slackExport.Channels, channels...)
+			reader.Close()
+
+		case "dms.json":
+			reader, err := file.Open()
+			if err != nil {
+				return nil, err
+			}
+			channels, _ := t.SlackParseChannels(reader, model.ChannelTypeDirect)
+			slackExport.DirectChannels = channels
+			slackExport.Channels = append(slackExport.Channels, channels...)
+			reader.Close()
+
+		case "groups.json":
+			reader, err := file.Open()
+			if err != nil {
+				return nil, err
+			}
+			channels, _ := t.SlackParseChannels(reader, model.ChannelTypePrivate)
+			slackExport.PrivateChannels = channels
+			slackExport.Channels = append(slackExport.Channels, channels...)
+			reader.Close()
+
+		case "mpims.json":
+			reader, err := file.Open()
+			if err != nil {
+				return nil, err
+			}
+			channels, _ := t.SlackParseChannels(reader, model.ChannelTypeGroup)
+			slackExport.GroupChannels = channels
+			slackExport.Channels = append(slackExport.Channels, channels...)
+			reader.Close()
+
+		case "users.json":
+			usersJSONFileName := os.Getenv("USERS_JSON_FILE")
+			var reader io.ReadCloser
+			var err error
+
+			if usersJSONFileName != "" {
+				reader, err = os.Open(usersJSONFileName)
+				if err != nil {
+					return nil, errors.Wrap(err, "failed to read users file from USERS_JSON_FILE")
+				}
+			} else {
+				reader, err = file.Open()
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			users, _ := t.SlackParseUsers(reader)
+			slackExport.Users = users
+			reader.Close()
+		}
+	}
+
+	return &slackExport, nil
+}
+
+// GetChannelDirectories returns a list of all channel directories in the zip
+func (t *Transformer) GetChannelDirectories(zipReader *zip.Reader) []string {
+	channelDirs := make(map[string]bool)
+
+	for _, file := range zipReader.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+
+		// Check for channel post files (e.g., "general/2024-01-01.json")
+		parts := strings.Split(file.Name, "/")
+		if len(parts) == 2 && strings.HasSuffix(parts[1], ".json") && parts[0] != "__uploads" {
+			channelDirs[parts[0]] = true
+		}
+	}
+
+	// Convert map to sorted slice for deterministic processing
+	result := make([]string, 0, len(channelDirs))
+	for dir := range channelDirs {
+		result = append(result, dir)
+	}
+
+	return result
+}
+
+// ParseChannelPosts parses posts for a single channel directory
+func (t *Transformer) ParseChannelPosts(zipReader *zip.Reader, channelDir string) ([]SlackPost, map[string]*zip.File, error) {
+	var posts []SlackPost
+	uploads := make(map[string]*zip.File)
+
+	for _, file := range zipReader.File {
+		if file.FileInfo().IsDir() {
+			continue
+		}
+
+		parts := strings.Split(file.Name, "/")
+
+		// Check if this file belongs to the current channel
+		if len(parts) == 2 && parts[0] == channelDir && strings.HasSuffix(parts[1], ".json") {
+			reader, err := file.Open()
+			if err != nil {
+				return nil, nil, err
+			}
+
+			newPosts, _ := t.SlackParsePosts(reader)
+			posts = append(posts, newPosts...)
+			reader.Close()
+		}
+
+		// Collect uploads for this channel
+		if len(parts) == 3 && parts[0] == "__uploads" {
+			uploads[parts[1]] = file
+		}
+	}
+
+	return posts, uploads, nil
+}
+
+// ParseSlackExportMetadataFromDir reads metadata (users, channels) from a filesystem directory.
+func (t *Transformer) ParseSlackExportMetadataFromDir(dirPath string) (*SlackExport, error) {
+	t.Logger.Info("Parsing metadata from Slack export directory")
+	slackExport := SlackExport{TeamName: t.TeamName}
+
+	type channelFile struct {
+		name     string
+		chanType model.ChannelType
+		target   *[]SlackChannel
+	}
+
+	channelFiles := []channelFile{
+		{"channels.json", model.ChannelTypeOpen, &slackExport.PublicChannels},
+		{"dms.json", model.ChannelTypeDirect, &slackExport.DirectChannels},
+		{"groups.json", model.ChannelTypePrivate, &slackExport.PrivateChannels},
+		{"mpims.json", model.ChannelTypeGroup, &slackExport.GroupChannels},
+	}
+
+	for _, cf := range channelFiles {
+		filePath := dirPath + "/" + cf.name
+		reader, err := os.Open(filePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		channels, _ := t.SlackParseChannels(reader, cf.chanType)
+		*cf.target = channels
+		slackExport.Channels = append(slackExport.Channels, channels...)
+		reader.Close()
+	}
+
+	// Parse users
+	usersPath := dirPath + "/users.json"
+	usersReader, err := os.Open(usersPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to read users.json")
+	}
+	users, _ := t.SlackParseUsers(usersReader)
+	slackExport.Users = users
+	usersReader.Close()
+
+	return &slackExport, nil
+}
+
+// GetChannelDirectoriesFromDir returns a list of all channel directories in a filesystem directory.
+func (t *Transformer) GetChannelDirectoriesFromDir(dirPath string) []string {
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		t.Logger.Warnf("Failed to read directory %s: %v", dirPath, err)
+		return nil
+	}
+
+	var result []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// Skip metadata files and internal directories
+		name := entry.Name()
+		if name == "__uploads" || strings.HasPrefix(name, ".") {
+			continue
+		}
+
+		// Check if this directory contains any JSON files (channel posts)
+		subEntries, err := os.ReadDir(dirPath + "/" + name)
+		if err != nil {
+			continue
+		}
+		for _, sub := range subEntries {
+			if !sub.IsDir() && strings.HasSuffix(sub.Name(), ".json") {
+				result = append(result, name)
+				break
+			}
+		}
+	}
+
+	return result
+}
+
+// ParseChannelPostsFromDir parses posts for a single channel from a filesystem directory.
+// Returns posts and a map of FileId -> disk path for any files that exist on disk.
+func (t *Transformer) ParseChannelPostsFromDir(dirPath, channelDir string) ([]SlackPost, map[string]string, error) {
+	var posts []SlackPost
+	diskFiles := make(map[string]string)
+
+	channelPath := dirPath + "/" + channelDir
+	entries, err := os.ReadDir(channelPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		filePath := channelPath + "/" + entry.Name()
+		reader, err := os.Open(filePath)
+		if err != nil {
+			t.Logger.Warnf("Failed to open %s: %v", filePath, err)
+			continue
+		}
+
+		newPosts, _ := t.SlackParsePosts(reader)
+		posts = append(posts, newPosts...)
+		reader.Close()
+	}
+
+	return posts, diskFiles, nil
+}

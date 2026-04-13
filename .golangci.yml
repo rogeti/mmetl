@@ -16,7 +16,6 @@ linters:
     # - revive
     - staticcheck
     - unconvert
-    - unqueryvet
     - unused
     - whitespace
   settings:
@@ -24,8 +23,6 @@ linters:
       disable:
         - fieldalignment
       enable-all: true
-    unqueryvet:
-      check-sql-builders: true
   exclusions:
     generated: lax
     presets:

@@ -183,6 +183,7 @@ func (t *Transformer) TransformUsers(users []SlackUser, skipEmptyEmails bool, de
 			Email:       user.Profile.Email,
 			Password:    model.NewId(),
 			DeleteAt:    deleteAt,
+			IsBot:       user.IsBot,
 		}
 
 		t.Logger.Debugf("TransformUsers: newUser IntermediateUser struct: %+v", newUser)
@@ -193,7 +194,8 @@ func (t *Transformer) TransformUsers(users []SlackUser, skipEmptyEmails bool, de
 			} else {
 				t.Logger.Warnf("Bot user %s has no BotID in profile, falling back to user ID %s", user.Username, user.Id)
 			}
-			newUser.IsBot = true
+			newUser.DisplayName = user.Profile.RealName
+			t.Logger.Infof("Identified bot user: %s (ID: %s)", user.Username, newUser.Id)
 		}
 
 		if !newUser.IsBot {
@@ -982,4 +984,275 @@ func makeAlphaNum(str string, allowAdditional ...rune) string {
 
 var specialReplacements = map[string]string{
 	"ß": "ss",
+}
+
+// TransformStream processes the Slack export in a streaming fashion to minimize memory usage.
+// It processes channels one at a time instead of loading all posts into memory.
+func (t *Transformer) TransformStream(zipReader *zip.Reader, outputFilePath string, attachmentsDir string, skipConvertPosts, skipAttachments, discardInvalidProps, allowDownload, skipEmptyEmails bool, defaultEmailDomain, botOwner string) error {
+	t.Logger.Info("Starting streaming transformation")
+
+	// Phase 1: Parse metadata (users, channels) - small enough to keep in memory
+	t.Logger.Info("Parsing metadata (users and channels)")
+	metadata, err := t.ParseSlackExportMetadata(zipReader)
+	if err != nil {
+		return err
+	}
+
+	// Transform users and channels
+	t.TransformUsers(metadata.Users, skipEmptyEmails, defaultEmailDomain)
+	if err := t.TransformAllChannels(metadata); err != nil {
+		return err
+	}
+	t.PopulateUserMemberships()
+	t.PopulateChannelMemberships()
+
+	// Validate that --bot-owner is provided if there are bot users
+	hasBots := false
+	for _, user := range t.Intermediate.UsersById {
+		if user.IsBot {
+			hasBots = true
+			break
+		}
+	}
+	if hasBots && botOwner == "" {
+		return fmt.Errorf("the Slack export contains bot users but --bot-owner was not specified. Please provide the username of a Mattermost user who will own the imported bots")
+	}
+
+	// Phase 2: Open output file and write header/metadata
+	t.Logger.Info("Creating output file and writing header")
+	outputFile, err := os.Create(outputFilePath)
+	if err != nil {
+		return err
+	}
+	defer outputFile.Close()
+
+	// Write version
+	if err := t.ExportVersion(outputFile); err != nil {
+		return err
+	}
+
+	// Write channels
+	t.Logger.Info("Exporting public channels")
+	if err := t.ExportChannels(t.Intermediate.PublicChannels, outputFile); err != nil {
+		return err
+	}
+
+	t.Logger.Info("Exporting private channels")
+	if err := t.ExportChannels(t.Intermediate.PrivateChannels, outputFile); err != nil {
+		return err
+	}
+
+	// Write users
+	t.Logger.Info("Exporting users")
+	if err := t.ExportUsers(outputFile, botOwner); err != nil {
+		return err
+	}
+
+	t.Logger.Info("Exporting group channels")
+	if err := t.ExportDirectChannels(t.Intermediate.GroupChannels, outputFile); err != nil {
+		return err
+	}
+
+	t.Logger.Info("Exporting direct channels")
+	if err := t.ExportDirectChannels(t.Intermediate.DirectChannels, outputFile); err != nil {
+		return err
+	}
+
+	// Phase 3: Stream process each channel's posts
+	t.Logger.Info("Streaming posts by channel")
+	channelDirs := t.GetChannelDirectories(zipReader)
+	t.Logger.Infof("Found %d channels with posts", len(channelDirs))
+
+	for i, channelDir := range channelDirs {
+		t.Logger.Infof("Processing channel %d of %d: %s", i+1, len(channelDirs), channelDir)
+
+		// Parse posts for this channel only
+		posts, uploads, err := t.ParseChannelPosts(zipReader, channelDir)
+		if err != nil {
+			t.Logger.Warnf("Error parsing posts for channel %s: %v", channelDir, err)
+			continue
+		}
+
+		// Convert mentions/markup if needed
+		if !skipConvertPosts {
+			channelPosts := map[string][]SlackPost{channelDir: posts}
+			channelPosts = t.SlackConvertUserMentions(metadata.Users, channelPosts)
+			channelPosts = t.SlackConvertChannelMentions(metadata.Channels, channelPosts)
+			channelPosts = t.SlackConvertPostsMarkup(channelPosts)
+			posts = channelPosts[channelDir]
+		}
+
+		// Transform posts for this channel
+		channelExport := &SlackExport{
+			TeamName: metadata.TeamName,
+			Posts:    map[string][]SlackPost{channelDir: posts},
+			Uploads:  uploads,
+			Channels: metadata.Channels,
+			Users:    metadata.Users,
+		}
+
+		// Reset intermediate posts before transforming
+		t.Intermediate.Posts = nil
+
+		if err := t.TransformPosts(channelExport, attachmentsDir, skipAttachments, discardInvalidProps, allowDownload); err != nil {
+			t.Logger.Warnf("Error transforming posts for channel %s: %v", channelDir, err)
+			continue
+		}
+
+		// Write posts immediately
+		for _, post := range t.Intermediate.Posts {
+			line := GetImportLineFromPost(post, t.TeamName)
+			if err := ExportWriteLine(outputFile, line); err != nil {
+				return err
+			}
+		}
+
+		// Clear posts from memory
+		t.Intermediate.Posts = nil
+	}
+
+	t.Logger.Info("Streaming transformation complete")
+	return nil
+}
+
+// MakeAlphaNum is the exported version of makeAlphaNum for use by external packages.
+func MakeAlphaNum(str string, allowAdditional ...rune) string {
+	return makeAlphaNum(str, allowAdditional...)
+}
+
+// GetNormalisedFileName returns the normalized file path for a Slack file attachment.
+// Format: bulk-export-attachments/{FileId}_{normalized_name}
+func GetNormalisedFileName(fileId, fileName string) string {
+	n := makeAlphaNum(fileName, '.', '-', '_')
+	p := path.Join(attachmentsInternal, fmt.Sprintf("%s_%s", fileId, n))
+	return norm.NFC.String(p)
+}
+
+// addDiskFileToPost creates an attachment reference for a file that is already on disk.
+func addDiskFileToPost(file *SlackFile, diskFiles map[string]string, post *IntermediatePost, attachmentsDir string) error {
+	destFilePath := getNormalisedFilePath(file, attachmentsInternal)
+	post.Attachments = append(post.Attachments, destFilePath)
+	return nil
+}
+
+// TransformStreamFromDir processes a Slack export from a filesystem directory (not a zip).
+// Attachments are expected to already exist at their final paths in attachmentsDir.
+func (t *Transformer) TransformStreamFromDir(dirPath, outputFilePath, attachmentsDir string, skipConvertPosts, skipAttachments, discardInvalidProps, allowDownload, skipEmptyEmails bool, defaultEmailDomain, botOwner string) error {
+	t.Logger.Info("Starting directory-based streaming transformation")
+
+	// Phase 1: Parse metadata (users, channels) from filesystem
+	t.Logger.Info("Parsing metadata from directory")
+	metadata, err := t.ParseSlackExportMetadataFromDir(dirPath)
+	if err != nil {
+		return err
+	}
+
+	// Transform users and channels
+	t.TransformUsers(metadata.Users, skipEmptyEmails, defaultEmailDomain)
+	if err := t.TransformAllChannels(metadata); err != nil {
+		return err
+	}
+	t.PopulateUserMemberships()
+	t.PopulateChannelMemberships()
+
+	// Validate that --bot-owner is provided if there are bot users
+	hasBots := false
+	for _, user := range t.Intermediate.UsersById {
+		if user.IsBot {
+			hasBots = true
+			break
+		}
+	}
+	if hasBots && botOwner == "" {
+		return fmt.Errorf("the Slack export contains bot users but --bot-owner was not specified. Please provide the username of a Mattermost user who will own the imported bots")
+	}
+
+	// Phase 2: Open output file and write header/metadata
+	t.Logger.Info("Creating output file and writing header")
+	outputFile, err := os.Create(outputFilePath)
+	if err != nil {
+		return err
+	}
+	defer outputFile.Close()
+
+	if err := t.ExportVersion(outputFile); err != nil {
+		return err
+	}
+
+	t.Logger.Info("Exporting public channels")
+	if err := t.ExportChannels(t.Intermediate.PublicChannels, outputFile); err != nil {
+		return err
+	}
+
+	t.Logger.Info("Exporting private channels")
+	if err := t.ExportChannels(t.Intermediate.PrivateChannels, outputFile); err != nil {
+		return err
+	}
+
+	t.Logger.Info("Exporting users")
+	if err := t.ExportUsers(outputFile, botOwner); err != nil {
+		return err
+	}
+
+	t.Logger.Info("Exporting group channels")
+	if err := t.ExportDirectChannels(t.Intermediate.GroupChannels, outputFile); err != nil {
+		return err
+	}
+
+	t.Logger.Info("Exporting direct channels")
+	if err := t.ExportDirectChannels(t.Intermediate.DirectChannels, outputFile); err != nil {
+		return err
+	}
+
+	// Phase 3: Stream process each channel's posts from directory
+	t.Logger.Info("Streaming posts by channel from directory")
+	channelDirs := t.GetChannelDirectoriesFromDir(dirPath)
+	t.Logger.Infof("Found %d channels with posts", len(channelDirs))
+
+	for i, channelDir := range channelDirs {
+		t.Logger.Infof("Processing channel %d of %d: %s", i+1, len(channelDirs), channelDir)
+
+		posts, diskFiles, err := t.ParseChannelPostsFromDir(dirPath, channelDir)
+		if err != nil {
+			t.Logger.Warnf("Error parsing posts for channel %s: %v", channelDir, err)
+			continue
+		}
+
+		if !skipConvertPosts {
+			channelPosts := map[string][]SlackPost{channelDir: posts}
+			channelPosts = t.SlackConvertUserMentions(metadata.Users, channelPosts)
+			channelPosts = t.SlackConvertChannelMentions(metadata.Channels, channelPosts)
+			channelPosts = t.SlackConvertPostsMarkup(channelPosts)
+			posts = channelPosts[channelDir]
+		}
+
+		// Build a SlackExport with empty uploads (files already on disk)
+		channelExport := &SlackExport{
+			TeamName: metadata.TeamName,
+			Posts:    map[string][]SlackPost{channelDir: posts},
+			Uploads:  make(map[string]*zip.File),
+			Channels: metadata.Channels,
+			Users:    metadata.Users,
+		}
+		_ = diskFiles // disk files already at final paths; addFileToPost handles path generation
+
+		t.Intermediate.Posts = nil
+
+		if err := t.TransformPosts(channelExport, attachmentsDir, skipAttachments, discardInvalidProps, allowDownload); err != nil {
+			t.Logger.Warnf("Error transforming posts for channel %s: %v", channelDir, err)
+			continue
+		}
+
+		for _, post := range t.Intermediate.Posts {
+			line := GetImportLineFromPost(post, t.TeamName)
+			if err := ExportWriteLine(outputFile, line); err != nil {
+				return err
+			}
+		}
+
+		t.Intermediate.Posts = nil
+	}
+
+	t.Logger.Info("Directory-based streaming transformation complete")
+	return nil
 }
