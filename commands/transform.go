@@ -132,30 +132,9 @@ func transformSlackCmdF(cmd *cobra.Command, args []string) error {
 	}
 	slackTransformer := slack.NewTransformer(team, logger)
 
-	slackExport, err := slackTransformer.ParseSlackExportFile(zipReader, skipConvertPosts)
+	// Use streaming transformation for large exports
+	err = slackTransformer.TransformStream(zipReader, outputFilePath, attachmentsDir, skipConvertPosts, skipAttachments, discardInvalidProps, allowDownload, skipEmptyEmails, defaultEmailDomain, botOwner)
 	if err != nil {
-		return err
-	}
-
-	err = slackTransformer.Transform(slackExport, attachmentsDir, skipAttachments, discardInvalidProps, allowDownload, skipEmptyEmails, defaultEmailDomain)
-	if err != nil {
-		return err
-	}
-
-	// Validate that --bot-owner is provided if there are bot users
-	hasBots := false
-	for _, user := range slackTransformer.Intermediate.UsersById {
-		if user.IsBot {
-			hasBots = true
-			break
-		}
-	}
-	botOwner = strings.TrimSpace(botOwner)
-	if hasBots && botOwner == "" {
-		return fmt.Errorf("the Slack export contains bot users but --bot-owner was not specified. Please provide the username of a Mattermost user who will own the imported bots")
-	}
-
-	if err = slackTransformer.Export(outputFilePath, botOwner); err != nil {
 		return err
 	}
 

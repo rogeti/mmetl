@@ -187,6 +187,29 @@ func GetImportLineFromDirectChannel(team string, channel *IntermediateChannel) *
 	}
 }
 
+func GetImportLineFromBot(user *IntermediateUser, owner string) *imports.LineImportData {
+	displayName := user.DisplayName
+	if displayName == "" {
+		displayName = user.Username
+	}
+
+	var deleteAt *int64
+	if user.DeleteAt > 0 {
+		deleteAt = model.NewPointer(user.DeleteAt)
+	}
+
+	return &imports.LineImportData{
+		Type: "bot",
+		Bot: &imports.BotImportData{
+			Username:    model.NewPointer(user.Username),
+			Owner:       model.NewPointer(owner),
+			DisplayName: model.NewPointer(displayName),
+			Description: model.NewPointer(user.Position),
+			DeleteAt:    deleteAt,
+		},
+	}
+}
+
 func GetImportLineFromUser(user *IntermediateUser, team string) *imports.LineImportData {
 	channelMemberships := []imports.UserChannelImportData{}
 	for _, membership := range user.Memberships {
@@ -232,23 +255,6 @@ func GetImportLineFromUser(user *IntermediateUser, team string) *imports.LineImp
 					Roles:    model.NewPointer(model.TeamUserRoleId),
 				},
 			},
-		},
-	}
-}
-
-func GetImportLineFromBot(user *IntermediateUser, owner string) *imports.LineImportData {
-	var deleteAt *int64
-	if user.DeleteAt > 0 {
-		deleteAt = model.NewPointer(user.DeleteAt)
-	}
-
-	return &imports.LineImportData{
-		Type: "bot",
-		Bot: &imports.BotImportData{
-			Username:    model.NewPointer(user.Username),
-			DisplayName: model.NewPointer(user.DisplayName),
-			Owner:       model.NewPointer(owner),
-			DeleteAt:    deleteAt,
 		},
 	}
 }
@@ -433,9 +439,10 @@ func (t *Transformer) ExportDirectChannels(channels []*IntermediateChannel, writ
 }
 
 func (t *Transformer) ExportUsers(writer io.Writer, botOwner string) error {
-	// Collect users from map and sort them by username for deterministic output
+	// Separate users and bots, sort by username for deterministic output
 	users := make([]*IntermediateUser, 0, len(t.Intermediate.UsersById))
 	bots := make([]*IntermediateUser, 0)
+
 	for _, user := range t.Intermediate.UsersById {
 		if user.IsBot {
 			bots = append(bots, user)
@@ -466,6 +473,7 @@ func (t *Transformer) ExportUsers(writer io.Writer, botOwner string) error {
 	}
 	for _, bot := range bots {
 		line := GetImportLineFromBot(bot, botOwner)
+		t.Logger.Infof("Exporting bot: %s (owner: %s)", bot.Username, botOwner)
 		if err := ExportWriteLine(writer, line); err != nil {
 			return err
 		}
