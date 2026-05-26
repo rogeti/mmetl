@@ -753,10 +753,12 @@ func getNormalisedFilePath(file *SlackFile, attachmentsDir string) string {
 }
 
 func addFileToPost(file *SlackFile, uploads map[string]*zip.File, post *IntermediatePost, attachmentsDir string, allowDownload bool) error {
-	if _, ok := uploads[file.Id]; ok || !allowDownload {
+	if _, ok := uploads[file.Id]; ok {
 		return addZipFileToPost(file, uploads, post, attachmentsDir)
 	}
-
+	if !allowDownload {
+		return addDiskFileToPost(file, nil, post, attachmentsDir)
+	}
 	return addDownloadToPost(file, post, attachmentsDir)
 }
 
