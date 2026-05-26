@@ -2,6 +2,8 @@ package slack
 
 import (
 	"archive/zip"
+	"encoding/json"
+	"strconv"
 
 	"github.com/mattermost/mattermost/server/public/model"
 )
@@ -95,6 +97,53 @@ type SlackPost struct {
 	Attachments []*model.SlackAttachment `json:"attachments"`
 	Reactions   []*SlackReaction         `json:"reactions"`
 	Room        *SlackRoom               `json:"room"`
+}
+
+// UnmarshalJSON implements custom unmarshaling for SlackPost to handle
+// Slack exports where attachment.id is a string instead of the int64
+// expected by model.SlackAttachment.
+func (p *SlackPost) UnmarshalJSON(data []byte) error {
+	// Use an alias to avoid infinite recursion.
+	type slackPostAlias SlackPost
+	var raw struct {
+		slackPostAlias
+		Attachments []json.RawMessage `json:"attachments"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*p = SlackPost(raw.slackPostAlias)
+	p.Attachments = nil
+
+	for _, rawAtt := range raw.Attachments {
+		att := &model.SlackAttachment{}
+		if err := json.Unmarshal(rawAtt, att); err != nil {
+			// Try fixing string "id" field
+			var attMap map[string]json.RawMessage
+			if mapErr := json.Unmarshal(rawAtt, &attMap); mapErr == nil {
+				if idRaw, ok := attMap["id"]; ok {
+					var idStr string
+					if json.Unmarshal(idRaw, &idStr) == nil {
+						if idInt, convErr := strconv.ParseInt(idStr, 10, 64); convErr == nil {
+							fixed, _ := json.Marshal(idInt)
+							attMap["id"] = fixed
+							fixedJSON, _ := json.Marshal(attMap)
+							if json.Unmarshal(fixedJSON, att) == nil {
+								p.Attachments = append(p.Attachments, att)
+								continue
+							}
+						}
+					}
+				}
+			}
+			// If we still can't parse, skip this attachment but keep going
+			p.Attachments = append(p.Attachments, att)
+			continue
+		}
+		p.Attachments = append(p.Attachments, att)
+	}
+
+	return nil
 }
 
 // IsPlainMessage returns true if the post is a plain message

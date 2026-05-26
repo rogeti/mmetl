@@ -307,8 +307,7 @@ func (t *Transformer) ParseSlackExportMetadata(zipReader *zip.Reader) (*SlackExp
 			}
 			channels, _ := t.SlackParseChannels(reader, model.ChannelTypeOpen)
 			slackExport.PublicChannels = channels
-			slackExport.Channels = append(slackExport.Channels, channels...)
-			reader.Close()
+				reader.Close()
 
 		case "dms.json":
 			reader, err := file.Open()
@@ -317,8 +316,7 @@ func (t *Transformer) ParseSlackExportMetadata(zipReader *zip.Reader) (*SlackExp
 			}
 			channels, _ := t.SlackParseChannels(reader, model.ChannelTypeDirect)
 			slackExport.DirectChannels = channels
-			slackExport.Channels = append(slackExport.Channels, channels...)
-			reader.Close()
+				reader.Close()
 
 		case "groups.json":
 			reader, err := file.Open()
@@ -327,8 +325,7 @@ func (t *Transformer) ParseSlackExportMetadata(zipReader *zip.Reader) (*SlackExp
 			}
 			channels, _ := t.SlackParseChannels(reader, model.ChannelTypePrivate)
 			slackExport.PrivateChannels = channels
-			slackExport.Channels = append(slackExport.Channels, channels...)
-			reader.Close()
+				reader.Close()
 
 		case "mpims.json":
 			reader, err := file.Open()
@@ -337,8 +334,7 @@ func (t *Transformer) ParseSlackExportMetadata(zipReader *zip.Reader) (*SlackExp
 			}
 			channels, _ := t.SlackParseChannels(reader, model.ChannelTypeGroup)
 			slackExport.GroupChannels = channels
-			slackExport.Channels = append(slackExport.Channels, channels...)
-			reader.Close()
+				reader.Close()
 
 		case "users.json":
 			usersJSONFileName := os.Getenv("USERS_JSON_FILE")
@@ -453,7 +449,6 @@ func (t *Transformer) ParseSlackExportMetadataFromDir(dirPath string) (*SlackExp
 		}
 		channels, _ := t.SlackParseChannels(reader, cf.chanType)
 		*cf.target = channels
-		slackExport.Channels = append(slackExport.Channels, channels...)
 		reader.Close()
 	}
 

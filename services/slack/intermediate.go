@@ -2,13 +2,16 @@ package slack
 
 import (
 	"archive/zip"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -111,6 +114,83 @@ func (t *Transformer) ComputeChannelPostStats() {
 			ch.MsgCount++
 			if reply.CreateAt > ch.LastPostAt {
 				ch.LastPostAt = reply.CreateAt
+			}
+		}
+	}
+}
+
+// ComputeChannelPostStatsFromDir scans raw Slack post JSON files on disk to
+// accumulate MsgCount, MsgCountRoot, and LastPostAt on each IntermediateChannel.
+// This is a lightweight pre-scan for streaming transforms that need membership
+// stats before writing users/channels to the output file.
+func (t *Transformer) ComputeChannelPostStatsFromDir(dirPath string) {
+	channelsByOriginalName := buildChannelsByOriginalNameMap(t.Intermediate)
+
+	channelDirs := t.GetChannelDirectoriesFromDir(dirPath)
+	for _, channelDir := range channelDirs {
+		ch, ok := channelsByOriginalName[channelDir]
+		if !ok {
+			continue
+		}
+
+		posts, _, err := t.ParseChannelPostsFromDir(dirPath, channelDir)
+		if err != nil {
+			t.Logger.Warnf("ComputeChannelPostStatsFromDir: error parsing %s: %v", channelDir, err)
+			continue
+		}
+
+		for _, post := range posts {
+			if !post.IsPlainMessage() && !post.IsBotMessage() && !post.IsFileComment() && !post.IsMeMessage() {
+				continue
+			}
+
+			ts := SlackConvertTimeStamp(post.TimeStamp)
+
+			// Count root posts
+			if post.ThreadTS == "" || post.ThreadTS == post.TimeStamp {
+				ch.MsgCountRoot++
+			}
+			ch.MsgCount++
+
+			if ts > ch.LastPostAt {
+				ch.LastPostAt = ts
+			}
+		}
+	}
+}
+
+// ComputeChannelPostStatsFromZip is like ComputeChannelPostStatsFromDir but
+// reads from a zip archive.
+func (t *Transformer) ComputeChannelPostStatsFromZip(zipReader *zip.Reader) {
+	channelsByOriginalName := buildChannelsByOriginalNameMap(t.Intermediate)
+
+	channelDirs := t.GetChannelDirectories(zipReader)
+	for _, channelDir := range channelDirs {
+		ch, ok := channelsByOriginalName[channelDir]
+		if !ok {
+			continue
+		}
+
+		posts, _, err := t.ParseChannelPosts(zipReader, channelDir)
+		if err != nil {
+			t.Logger.Warnf("ComputeChannelPostStatsFromZip: error parsing %s: %v", channelDir, err)
+			continue
+		}
+
+		for _, post := range posts {
+			if !post.IsPlainMessage() && !post.IsBotMessage() && !post.IsFileComment() && !post.IsMeMessage() {
+				continue
+			}
+
+			ts := SlackConvertTimeStamp(post.TimeStamp)
+
+			if post.ThreadTS == "" || post.ThreadTS == post.TimeStamp {
+				ch.MsgCountRoot++
+			}
+			ch.MsgCount++
+
+			if ts > ch.LastPostAt {
+				ch.LastPostAt = ts
 			}
 		}
 	}
@@ -1279,6 +1359,11 @@ func (t *Transformer) TransformStream(zipReader *zip.Reader, outputFilePath stri
 	t.PopulateUserMemberships()
 	t.PopulateChannelMemberships()
 
+	// Pre-scan posts to compute channel stats for membership read-state
+	t.Logger.Info("Pre-scanning posts for channel membership stats")
+	t.ComputeChannelPostStatsFromZip(zipReader)
+	t.applyChannelStatsToMemberships()
+
 	// Validate that --bot-owner is provided if there are bot users
 	hasBots := false
 	for _, user := range t.Intermediate.UsersById {
@@ -1299,35 +1384,38 @@ func (t *Transformer) TransformStream(zipReader *zip.Reader, outputFilePath stri
 	}
 	defer outputFile.Close()
 
+	// Buffer all output writes (1MB) to avoid thousands of tiny write syscalls
+	outputWriter := bufio.NewWriterSize(outputFile, 1024*1024)
+
 	// Write version
-	if err := t.ExportVersion(outputFile); err != nil {
+	if err := t.ExportVersion(outputWriter); err != nil {
 		return err
 	}
 
 	// Write channels
 	t.Logger.Info("Exporting public channels")
-	if err := t.ExportChannels(t.Intermediate.PublicChannels, outputFile); err != nil {
+	if err := t.ExportChannels(t.Intermediate.PublicChannels, outputWriter); err != nil {
 		return err
 	}
 
 	t.Logger.Info("Exporting private channels")
-	if err := t.ExportChannels(t.Intermediate.PrivateChannels, outputFile); err != nil {
+	if err := t.ExportChannels(t.Intermediate.PrivateChannels, outputWriter); err != nil {
 		return err
 	}
 
 	// Write users
 	t.Logger.Info("Exporting users")
-	if err := t.ExportUsers(outputFile, botOwner); err != nil {
+	if err := t.ExportUsers(outputWriter, botOwner); err != nil {
 		return err
 	}
 
 	t.Logger.Info("Exporting group channels")
-	if err := t.ExportDirectChannels(t.Intermediate.GroupChannels, outputFile); err != nil {
+	if err := t.ExportDirectChannels(t.Intermediate.GroupChannels, outputWriter); err != nil {
 		return err
 	}
 
 	t.Logger.Info("Exporting direct channels")
-	if err := t.ExportDirectChannels(t.Intermediate.DirectChannels, outputFile); err != nil {
+	if err := t.ExportDirectChannels(t.Intermediate.DirectChannels, outputWriter); err != nil {
 		return err
 	}
 
@@ -1350,7 +1438,7 @@ func (t *Transformer) TransformStream(zipReader *zip.Reader, outputFilePath stri
 		if !skipConvertPosts {
 			channelPosts := map[string][]SlackPost{channelDir: posts}
 			channelPosts = t.SlackConvertUserMentions(metadata.Users, channelPosts)
-			channelPosts = t.SlackConvertChannelMentions(metadata.Channels, channelPosts)
+			channelPosts = t.SlackConvertChannelMentions(metadata.AllChannels(), channelPosts)
 			channelPosts = t.SlackConvertPostsMarkup(channelPosts)
 			posts = channelPosts[channelDir]
 		}
@@ -1360,7 +1448,6 @@ func (t *Transformer) TransformStream(zipReader *zip.Reader, outputFilePath stri
 			TeamName: metadata.TeamName,
 			Posts:    map[string][]SlackPost{channelDir: posts},
 			Uploads:  uploads,
-			Channels: metadata.Channels,
 			Users:    metadata.Users,
 		}
 
@@ -1375,13 +1462,17 @@ func (t *Transformer) TransformStream(zipReader *zip.Reader, outputFilePath stri
 		// Write posts immediately
 		for _, post := range t.Intermediate.Posts {
 			line := GetImportLineFromPost(post, t.TeamName)
-			if err := ExportWriteLine(outputFile, line); err != nil {
+			if err := ExportWriteLine(outputWriter, line); err != nil {
 				return err
 			}
 		}
 
 		// Clear posts from memory
 		t.Intermediate.Posts = nil
+	}
+
+	if err := outputWriter.Flush(); err != nil {
+		return fmt.Errorf("error flushing output: %w", err)
 	}
 
 	t.Logger.Info("Streaming transformation complete")
@@ -1428,6 +1519,11 @@ func (t *Transformer) TransformStreamFromDir(dirPath, outputFilePath, attachment
 	t.PopulateUserMemberships()
 	t.PopulateChannelMemberships()
 
+	// Pre-scan posts to compute channel stats for membership read-state
+	t.Logger.Info("Pre-scanning posts for channel membership stats")
+	t.ComputeChannelPostStatsFromDir(dirPath)
+	t.applyChannelStatsToMemberships()
+
 	// Validate that --bot-owner is provided if there are bot users
 	hasBots := false
 	for _, user := range t.Intermediate.UsersById {
@@ -1448,32 +1544,35 @@ func (t *Transformer) TransformStreamFromDir(dirPath, outputFilePath, attachment
 	}
 	defer outputFile.Close()
 
-	if err := t.ExportVersion(outputFile); err != nil {
+	// Buffer all output writes (1MB) to avoid thousands of tiny write syscalls
+	outputWriter := bufio.NewWriterSize(outputFile, 1024*1024)
+
+	if err := t.ExportVersion(outputWriter); err != nil {
 		return err
 	}
 
 	t.Logger.Info("Exporting public channels")
-	if err := t.ExportChannels(t.Intermediate.PublicChannels, outputFile); err != nil {
+	if err := t.ExportChannels(t.Intermediate.PublicChannels, outputWriter); err != nil {
 		return err
 	}
 
 	t.Logger.Info("Exporting private channels")
-	if err := t.ExportChannels(t.Intermediate.PrivateChannels, outputFile); err != nil {
+	if err := t.ExportChannels(t.Intermediate.PrivateChannels, outputWriter); err != nil {
 		return err
 	}
 
 	t.Logger.Info("Exporting users")
-	if err := t.ExportUsers(outputFile, botOwner); err != nil {
+	if err := t.ExportUsers(outputWriter, botOwner); err != nil {
 		return err
 	}
 
 	t.Logger.Info("Exporting group channels")
-	if err := t.ExportDirectChannels(t.Intermediate.GroupChannels, outputFile); err != nil {
+	if err := t.ExportDirectChannels(t.Intermediate.GroupChannels, outputWriter); err != nil {
 		return err
 	}
 
 	t.Logger.Info("Exporting direct channels")
-	if err := t.ExportDirectChannels(t.Intermediate.DirectChannels, outputFile); err != nil {
+	if err := t.ExportDirectChannels(t.Intermediate.DirectChannels, outputWriter); err != nil {
 		return err
 	}
 
@@ -1494,7 +1593,7 @@ func (t *Transformer) TransformStreamFromDir(dirPath, outputFilePath, attachment
 		if !skipConvertPosts {
 			channelPosts := map[string][]SlackPost{channelDir: posts}
 			channelPosts = t.SlackConvertUserMentions(metadata.Users, channelPosts)
-			channelPosts = t.SlackConvertChannelMentions(metadata.Channels, channelPosts)
+			channelPosts = t.SlackConvertChannelMentions(metadata.AllChannels(), channelPosts)
 			channelPosts = t.SlackConvertPostsMarkup(channelPosts)
 			posts = channelPosts[channelDir]
 		}
@@ -1504,7 +1603,6 @@ func (t *Transformer) TransformStreamFromDir(dirPath, outputFilePath, attachment
 			TeamName: metadata.TeamName,
 			Posts:    map[string][]SlackPost{channelDir: posts},
 			Uploads:  make(map[string]*zip.File),
-			Channels: metadata.Channels,
 			Users:    metadata.Users,
 		}
 		_ = diskFiles // disk files already at final paths; addFileToPost handles path generation
@@ -1518,7 +1616,7 @@ func (t *Transformer) TransformStreamFromDir(dirPath, outputFilePath, attachment
 
 		for _, post := range t.Intermediate.Posts {
 			line := GetImportLineFromPost(post, t.TeamName)
-			if err := ExportWriteLine(outputFile, line); err != nil {
+			if err := ExportWriteLine(outputWriter, line); err != nil {
 				return err
 			}
 		}
@@ -1526,6 +1624,324 @@ func (t *Transformer) TransformStreamFromDir(dirPath, outputFilePath, attachment
 		t.Intermediate.Posts = nil
 	}
 
+	if err := outputWriter.Flush(); err != nil {
+		return fmt.Errorf("error flushing output: %w", err)
+	}
+
 	t.Logger.Info("Directory-based streaming transformation complete")
 	return nil
+}
+
+// channelWork represents a single channel directory to process in parallel.
+type channelWork struct {
+	channelDir string
+	isDirect   bool                 // true if channel produces direct_post lines
+	channel    *IntermediateChannel // pointer to shared channel for stats accumulation
+}
+
+// channelStatsMu protects concurrent updates to IntermediateChannel stats fields.
+var channelStatsMu sync.Mutex
+
+// workerResult holds the temp file paths produced by a single worker.
+type workerResult struct {
+	postFile  string // temp file containing "post" lines (may be empty)
+	dpostFile string // temp file containing "direct_post" lines (may be empty)
+	err       error
+}
+
+// TransformStreamFromDirParallel is like TransformStreamFromDir but processes
+// channel posts in parallel using numWorkers goroutines. Each worker writes to
+// its own temp files (one for posts, one for direct_posts), which are then
+// concatenated onto the output file in the correct type order.
+func (t *Transformer) TransformStreamFromDirParallel(dirPath, outputFilePath, attachmentsDir string, skipConvertPosts, skipAttachments, discardInvalidProps, allowDownload, skipEmptyEmails bool, defaultEmailDomain, botOwner string, numWorkers int) error {
+	t.Logger.Infof("Starting parallel directory-based transformation with %d workers", numWorkers)
+
+	// Phase 1: Parse metadata (users, channels) — identical to serial version
+	t.Logger.Info("Parsing metadata from directory")
+	metadata, err := t.ParseSlackExportMetadataFromDir(dirPath)
+	if err != nil {
+		return err
+	}
+
+	t.TransformUsers(metadata.Users, skipEmptyEmails, defaultEmailDomain)
+	if err := t.TransformAllChannels(metadata); err != nil {
+		return err
+	}
+	t.PopulateUserMemberships()
+	t.PopulateChannelMemberships()
+
+	hasBots := false
+	for _, user := range t.Intermediate.UsersById {
+		if user.IsBot {
+			hasBots = true
+			break
+		}
+	}
+	if hasBots && botOwner == "" {
+		return fmt.Errorf("the Slack export contains bot users but --bot-owner was not specified. Please provide the username of a Mattermost user who will own the imported bots")
+	}
+
+	// Phase 2: Classify channel directories and dispatch to workers
+	// Workers accumulate channel stats inline (no pre-scan needed).
+	channelDirs := t.GetChannelDirectoriesFromDir(dirPath)
+	t.Logger.Infof("Found %d channels with posts, dispatching to %d workers", len(channelDirs), numWorkers)
+
+	channelsByOriginalName := buildChannelsByOriginalNameMap(t.Intermediate)
+
+	var work []channelWork
+	for _, dir := range channelDirs {
+		ch, ok := channelsByOriginalName[dir]
+		if !ok {
+			t.Logger.Warnf("Channel directory %s not found in metadata, skipping", dir)
+			continue
+		}
+		isDirect := ch.Type == model.ChannelTypeDirect || ch.Type == model.ChannelTypeGroup
+		work = append(work, channelWork{channelDir: dir, isDirect: isDirect, channel: ch})
+	}
+
+	if len(work) == 0 {
+		t.Logger.Info("No channels to process")
+		return nil
+	}
+
+	jobs := make(chan channelWork, len(work))
+	for _, w := range work {
+		jobs <- w
+	}
+	close(jobs)
+
+	results := make([]workerResult, numWorkers)
+	tmpDir := filepath.Dir(outputFilePath)
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			results[workerID] = t.processChannelWorker(
+				workerID, dirPath, metadata, attachmentsDir, tmpDir,
+				skipConvertPosts, skipAttachments, discardInvalidProps, allowDownload,
+				jobs,
+			)
+		}(w)
+	}
+	wg.Wait()
+
+	// Collect temp file paths, clean up on error
+	var postFiles, dpostFiles []string
+	var firstErr error
+	for _, r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		if r.postFile != "" {
+			postFiles = append(postFiles, r.postFile)
+		}
+		if r.dpostFile != "" {
+			dpostFiles = append(dpostFiles, r.dpostFile)
+		}
+	}
+
+	if firstErr != nil {
+		// Clean up all temp files
+		for _, f := range append(postFiles, dpostFiles...) {
+			os.Remove(f)
+		}
+		return fmt.Errorf("parallel transform failed: %w", firstErr)
+	}
+
+	// Ensure all temp files are cleaned up even if assembly fails partway through
+	allTempFiles := append(postFiles, dpostFiles...)
+	defer func() {
+		for _, f := range allTempFiles {
+			os.Remove(f) // no-op if already removed by appendTempFile
+		}
+	}()
+
+	// Phase 3: Apply channel stats accumulated by workers, then write final output.
+	// Header (version, channels, users with membership stats) goes first,
+	// then post temp files, then direct_post temp files.
+	t.Logger.Info("Applying channel membership stats from worker results")
+	t.applyChannelStatsToMemberships()
+
+	t.Logger.Info("Writing final output file")
+	outputFile, err := os.Create(outputFilePath)
+	if err != nil {
+		return err
+	}
+	defer outputFile.Close()
+
+	// Buffer all output writes (1MB) to avoid thousands of tiny write syscalls
+	outputWriter := bufio.NewWriterSize(outputFile, 1024*1024)
+
+	if err := t.ExportVersion(outputWriter); err != nil {
+		return err
+	}
+	if err := t.ExportChannels(t.Intermediate.PublicChannels, outputWriter); err != nil {
+		return err
+	}
+	if err := t.ExportChannels(t.Intermediate.PrivateChannels, outputWriter); err != nil {
+		return err
+	}
+	if err := t.ExportUsers(outputWriter, botOwner); err != nil {
+		return err
+	}
+	if err := t.ExportDirectChannels(t.Intermediate.GroupChannels, outputWriter); err != nil {
+		return err
+	}
+	if err := t.ExportDirectChannels(t.Intermediate.DirectChannels, outputWriter); err != nil {
+		return err
+	}
+
+	t.Logger.Infof("Merging %d post files and %d direct_post files", len(postFiles), len(dpostFiles))
+
+	for _, tmpPath := range postFiles {
+		if err := appendTempFile(outputWriter, tmpPath); err != nil {
+			return fmt.Errorf("error merging post temp file: %w", err)
+		}
+	}
+	for _, tmpPath := range dpostFiles {
+		if err := appendTempFile(outputWriter, tmpPath); err != nil {
+			return fmt.Errorf("error merging direct_post temp file: %w", err)
+		}
+	}
+
+	if err := outputWriter.Flush(); err != nil {
+		return fmt.Errorf("error flushing output: %w", err)
+	}
+
+	t.Logger.Info("Parallel directory-based streaming transformation complete")
+	return nil
+}
+
+// processChannelWorker runs in a goroutine, processing channels from the jobs
+// channel and writing results to per-worker temp files.
+func (t *Transformer) processChannelWorker(
+	workerID int,
+	dirPath string,
+	metadata *SlackExport,
+	attachmentsDir, tmpDir string,
+	skipConvertPosts, skipAttachments, discardInvalidProps, allowDownload bool,
+	jobs <-chan channelWork,
+) workerResult {
+	workerT := t.CloneForWorker()
+
+	postFile, err := os.CreateTemp(tmpDir, fmt.Sprintf("mmetl-post-%d-*.jsonl", workerID))
+	if err != nil {
+		return workerResult{err: fmt.Errorf("worker %d: create post temp file: %w", workerID, err)}
+	}
+	postWriter := bufio.NewWriterSize(postFile, 256*1024)
+
+	dpostFile, err := os.CreateTemp(tmpDir, fmt.Sprintf("mmetl-dpost-%d-*.jsonl", workerID))
+	if err != nil {
+		postFile.Close()
+		os.Remove(postFile.Name())
+		return workerResult{err: fmt.Errorf("worker %d: create dpost temp file: %w", workerID, err)}
+	}
+	dpostWriter := bufio.NewWriterSize(dpostFile, 256*1024)
+
+	processed := 0
+	for work := range jobs {
+		posts, diskFiles, err := workerT.ParseChannelPostsFromDir(dirPath, work.channelDir)
+		if err != nil {
+			workerT.Logger.Warnf("Worker %d: error parsing posts for channel %s: %v", workerID, work.channelDir, err)
+			continue
+		}
+
+		if !skipConvertPosts {
+			channelPosts := map[string][]SlackPost{work.channelDir: posts}
+			channelPosts = workerT.SlackConvertUserMentions(metadata.Users, channelPosts)
+			channelPosts = workerT.SlackConvertChannelMentions(metadata.AllChannels(), channelPosts)
+			channelPosts = workerT.SlackConvertPostsMarkup(channelPosts)
+			posts = channelPosts[work.channelDir]
+		}
+
+		channelExport := &SlackExport{
+			TeamName: metadata.TeamName,
+			Posts:    map[string][]SlackPost{work.channelDir: posts},
+			Uploads:  make(map[string]*zip.File),
+			Users:    metadata.Users,
+		}
+		_ = diskFiles
+
+		workerT.Intermediate.Posts = nil
+		if err := workerT.TransformPosts(channelExport, attachmentsDir, skipAttachments, discardInvalidProps, allowDownload); err != nil {
+			workerT.Logger.Warnf("Worker %d: error transforming posts for channel %s: %v", workerID, work.channelDir, err)
+			continue
+		}
+
+		// Accumulate channel stats for membership read-state (under mutex since channel is shared)
+		if work.channel != nil {
+			var msgCount, msgCountRoot int64
+			var lastPostAt int64
+			for _, post := range workerT.Intermediate.Posts {
+				msgCount++
+				msgCountRoot++
+				if post.CreateAt > lastPostAt {
+					lastPostAt = post.CreateAt
+				}
+				for _, reply := range post.Replies {
+					msgCount++
+					if reply.CreateAt > lastPostAt {
+						lastPostAt = reply.CreateAt
+					}
+				}
+			}
+			channelStatsMu.Lock()
+			work.channel.MsgCount += msgCount
+			work.channel.MsgCountRoot += msgCountRoot
+			if lastPostAt > work.channel.LastPostAt {
+				work.channel.LastPostAt = lastPostAt
+			}
+			channelStatsMu.Unlock()
+		}
+
+		var writer *bufio.Writer
+		if work.isDirect {
+			writer = dpostWriter
+		} else {
+			writer = postWriter
+		}
+
+		for _, post := range workerT.Intermediate.Posts {
+			line := GetImportLineFromPost(post, workerT.TeamName)
+			if err := ExportWriteLine(writer, line); err != nil {
+				postWriter.Flush()
+				dpostWriter.Flush()
+				postFile.Close()
+				dpostFile.Close()
+				return workerResult{
+					postFile:  postFile.Name(),
+					dpostFile: dpostFile.Name(),
+					err:       fmt.Errorf("worker %d: write error: %w", workerID, err),
+				}
+			}
+		}
+		workerT.Intermediate.Posts = nil
+		processed++
+	}
+
+	postWriter.Flush()
+	dpostWriter.Flush()
+	postFile.Close()
+	dpostFile.Close()
+
+	workerT.Logger.Infof("Worker %d: processed %d channels", workerID, processed)
+
+	return workerResult{
+		postFile:  postFile.Name(),
+		dpostFile: dpostFile.Name(),
+	}
+}
+
+// appendTempFile copies the contents of a temp file to dst, then removes the temp file.
+func appendTempFile(dst io.Writer, tmpPath string) error {
+	src, err := os.Open(tmpPath)
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(dst, bufio.NewReaderSize(src, 256*1024))
+	src.Close()
+	os.Remove(tmpPath)
+	return err
 }
